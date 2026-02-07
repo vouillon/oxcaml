@@ -80,7 +80,7 @@ type primitive =
   | Getpredef of Ident.t
   | Boolnot
   | Isint
-  | Vectlength
+  | Vectlength of Lambda.array_kind
   | Setglobal of Compilation_unit.t
   | Getfield of int
   | Getfloatfield of int
@@ -107,9 +107,9 @@ type primitive =
   | Setfloatfield of int
   | Setvectitem
   | Setbyteschar
-  | Ccall of string
-  | Makeblock of { tag : int }
-  | Makefloatblock
+  | Ccall of string * Instruct.ccall_hint option
+  | Makeblock of { tag : int; mut : Asttypes.mutable_flag }
+  | Makefloatblock of Asttypes.mutable_flag
   | Make_faux_mixedblock of
       { total_len : int;
         tag : int
@@ -124,9 +124,10 @@ and rec_binding =
 and bfunction =
   { params : Ident.t list;
     body : blambda;
-    free_variables : Ident.Set.t
+    free_variables : Ident.Set.t;
         (** if we ever intended to do optimizations/transformations on blambda,
             this would be better as a function than a field *)
+    closure_hint : Instruct.closure_hint
   }
 
 and blambda =

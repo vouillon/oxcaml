@@ -60,6 +60,10 @@ let mk_binannot_occurrences f =
     features such as project-wide occurrences. This flag has\n\
     no effect in the absence of '-bin-annot'."
 
+let mk_bytecode_hints f =
+  "-bytecode-hints", Arg.Unit f,
+  " Include bytecode hints in executable"
+
 let mk_c f =
   "-c", Arg.Unit f, " Compile only (do not link)"
 
@@ -1247,6 +1251,7 @@ end
 module type Bytecomp_options = sig
   include Core_options
   include Compiler_options
+  val _bytecode_hints : unit -> unit
   val _compat_32 : unit -> unit
   val _custom : unit -> unit
   val _no_check_prims : unit -> unit
@@ -1417,6 +1422,7 @@ struct
     mk_binannot F._binannot;
     mk_binannot_cms F._binannot_cms;
     mk_binannot_occurrences F._binannot_occurrences;
+    mk_bytecode_hints F._bytecode_hints;
     mk_c F._c;
     mk_cc F._cc;
     mk_cclib F._cclib;
@@ -2660,6 +2666,7 @@ third-party libraries such as Lwt, but with a different API."
 
     include Core
     include Compiler
+    let _bytecode_hints = set bytecode_hints
     let _compat_32 = set bytecode_compatible_32
     let _custom = set custom_runtime
     let _dcamlprimc = set keep_camlprimc_file

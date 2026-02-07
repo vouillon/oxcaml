@@ -33,7 +33,7 @@ let primitive ppf = function
   | Getpredef i -> fprintf ppf "getpredef %a" Ident.print i
   | Boolnot -> pp_print_string ppf "boolnot"
   | Isint -> pp_print_string ppf "isint"
-  | Vectlength -> pp_print_string ppf "vectlength"
+  | Vectlength _ -> pp_print_string ppf "vectlength"
   | Setglobal c ->
     fprintf ppf "setglobal %a" (Format_doc.compat Compilation_unit.print) c
   | Getfield i -> fprintf ppf "getfield %d" i
@@ -63,9 +63,9 @@ let primitive ppf = function
   | Setfloatfield i -> fprintf ppf "setfloatfield %d" i
   | Setvectitem -> pp_print_string ppf "setvectitem"
   | Setbyteschar -> pp_print_string ppf "setbyteschar"
-  | Ccall s -> fprintf ppf "ccall %s" s
-  | Makeblock { tag } -> fprintf ppf "makeblock %d" tag
-  | Makefloatblock -> pp_print_string ppf "makefloatblock"
+  | Ccall (s, _) -> fprintf ppf "ccall %s" s
+  | Makeblock { tag; _ } -> fprintf ppf "makeblock %d" tag
+  | Makefloatblock _ -> pp_print_string ppf "makefloatblock"
   | Make_faux_mixedblock { total_len; tag } ->
     fprintf ppf "make_faux_mixedblock {total_len=%d; tag=%d}" total_len tag
   | Check_signals -> pp_print_string ppf "check_signals"
@@ -225,7 +225,7 @@ let rec blambda ppf = function
 and rec_binding ppf { id; def } =
   fprintf ppf "@[<2>%a@ =@ %a@]" Ident.print id bfunction def
 
-and bfunction ppf { params; body; free_variables = _ } =
+and bfunction ppf { params; body; free_variables = _; closure_hint = _ } =
   fprintf ppf "@[<2>(fun@ @[%a@]@ ->@ %a)@]"
     (pp_print_list ~pp_sep:pp_print_space Ident.print)
     params blambda body

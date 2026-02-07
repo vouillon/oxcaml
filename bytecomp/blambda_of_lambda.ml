@@ -24,6 +24,10 @@ let is_nontail : Lambda.region_close -> bool = function
   | Rc_nontail -> true
   | Rc_normal | Rc_close_at_apply -> false
 
+let ast_mut : Lambda.mutable_flag -> Asttypes.mutable_flag = function
+  | Immutable | Immutable_unique -> Immutable
+  | Mutable -> Mutable
+
 module Storer = Switch.Store (struct
   type t = Lambda.lambda
 
@@ -53,7 +57,8 @@ let unit = Const Lambda.const_unit
 
 let boolnot x = Prim (Boolnot, [x])
 
-let kccallf f fmt = Printf.ksprintf (fun name -> f (Ccall name)) fmt
+let kccallf f fmt =
+  Printf.ksprintf (fun name -> f (Ccall (name, None))) fmt
 
 let ccallf fmt = kccallf Fun.id fmt
 
@@ -226,7 +231,9 @@ let copy_unboxed_product shape ~path expr =
                copy_element field_elt (Prim (Getfield i, [Var id])))
              elements)
       in
-      Let { id; arg = expr; body = Prim (Makeblock { tag = 0 }, copied_fields) }
+      Let { id; arg = expr;
+            body = Prim (Makeblock { tag = 0; mut = Immutable },
+                         copied_fields) }
     | Value _ | Float_boxed _ | Float64 | Float32 | Bits8 | Bits16 | Bits32
     | Bits64 | Vec128 | Vec256 | Vec512 | Word | Untagged_immediate ->
       expr
@@ -235,12 +242,21 @@ let copy_unboxed_product shape ~path expr =
   copy_element (Lambda.project_from_mixed_block_shape shape ~path) expr
 
 let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
-  let comp_fun ({ params; body; loc = _ } as lfunction : Lambda.lfunction) :
-      Blambda.bfunction =
+  let comp_fun
+      ({ params; body; return; attr; loc = _ } as lfunction :
+        Lambda.lfunction) : Blambda.bfunction =
     (* assume kind = Curried *)
+    let closure_hint : Instruct.closure_hint =
+      { params = List.map (fun (p : Lambda.lparam) -> p.layout) params;
+        return;
+        inline = attr.inline;
+        specialise = attr.specialise;
+        is_a_functor = attr.is_a_functor }
+    in
     { params = List.map (fun (p : Lambda.lparam) -> p.name) params;
       body = comp_expr body;
-      free_variables = Lambda.free_variables (Lfunction lfunction)
+      free_variables = Lambda.free_variables (Lfunction lfunction);
+      closure_hint
     }
   in
   let comp_rec_binding ({ id; def } : Lambda.rec_binding) : Blambda.rec_binding
@@ -345,7 +361,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
   | Lprim (primitive, args, loc) -> (
     let simd_is_not_supported () =
       let args = List.map comp_expr args in
-      Blambda.Prim (Ccall "caml_simd_bytecode_not_supported", args)
+      Blambda.Prim (Ccall ("caml_simd_bytecode_not_supported", None), args)
     in
     let wrong_arity ~expected =
       Misc.fatal_errorf "Blambda_of_lambda: %a takes exactly %d %s"
@@ -369,7 +385,8 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
     let unary = n_ary ~arity:1 in
     let binary = n_ary ~arity:2 in
     let ternary = n_ary ~arity:3 in
-    let indexing_primitive (index_kind : Lambda.array_index_kind) prefix :
+    let indexing_primitive ?(hint = None)
+        (index_kind : Lambda.array_index_kind) prefix :
         Blambda.primitive =
       let suffix =
         match index_kind with
@@ -384,7 +401,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         | Punboxed_or_untagged_integer_index Unboxed_nativeint ->
           "_indexed_by_nativeint"
       in
-      Ccall (prefix ^ suffix)
+      Ccall (prefix ^ suffix, hint)
     in
     match (primitive : Lambda.primitive) with
     | Pphys_equal cmp -> (
@@ -421,11 +438,12 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       | [x; y] -> Sequor (comp_expr x, comp_expr y)
       | _ -> wrong_arity ~expected:2)
     | Praise k -> unary (Raise k)
-    | Pmakefloatblock _ | Pmakeufloatblock _ ->
+    | Pmakefloatblock (mut, _) | Pmakeufloatblock (mut, _) ->
       (* In bytecode, float# is boxed, so we can treat these two primitives the
          same. *)
-      pseudo_event (variadic Makefloatblock)
-    | Pmakearray (kind, _, _) ->
+      pseudo_event (variadic (Makefloatblock (ast_mut mut)))
+    | Pmakearray (kind, mut, _) ->
+      let mut = ast_mut mut in
       pseudo_event
         (match kind with
         (* arrays of unboxed types have the same representation
@@ -434,17 +452,19 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         | Punboxedoruntaggedintarray _
         | Punboxedfloatarray Unboxed_float32
         | Pgcscannableproductarray _ | Pgcignorableproductarray _ ->
-          variadic (Makeblock { tag = 0 })
+          variadic (Makeblock { tag = 0; mut })
         | Pfloatarray | Punboxedfloatarray Unboxed_float64 ->
-          variadic Makefloatblock
+          variadic (Makefloatblock mut)
         | Punboxedvectorarray _ -> simd_is_not_supported ()
         | Pgenarray -> (
-          let block = variadic (Makeblock { tag = 0 }) in
           match args with
-          | [] -> block
+          | [] ->
+            variadic (Makeblock { tag = 0; mut })
           | _ :: _ ->
             (* for the floatarray hack *)
-            Prim (Ccall "caml_array_of_uniform_array", [block])))
+            Prim
+              ( Ccall ("caml_array_of_uniform_array", None),
+                [variadic (Makeblock { tag = 0; mut })] )))
     | Presume -> context_switch Resume ~arity:3
     | Pwith_stack -> context_switch With_stack ~arity:5
     | Pwith_stack_bind -> context_switch With_stack_bind ~arity:7
@@ -523,10 +543,11 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       | [Lprim (Pmakearray (kind', _, m), args, _)] ->
         assert (kind = kind');
         comp_expr (Lambda.Lprim (Pmakearray (kind, mutability, m), args, loc))
-      | _ -> unary (Ccall "caml_obj_dup"))
-    | Pmakeblock (tag, _mut, shape, _) -> (
+      | _ -> unary (Ccall ("caml_obj_dup", None)))
+    | Pmakeblock (tag, mut, shape, _) -> (
+      let mut = ast_mut mut in
       match Lambda.mixed_block_of_block_shape shape with
-      | None -> pseudo_event (variadic (Makeblock { tag }))
+      | None -> pseudo_event (variadic (Makeblock { tag; mut }))
       | Some shape ->
         (* There is no notion of a mixed block at runtime in bytecode.
               Further, source-level unboxed types are represented as boxed in
@@ -534,7 +555,8 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
               them into the (normal, unmixed) block. *)
         let total_len = Array.length shape in
         pseudo_event (variadic (Make_faux_mixedblock { total_len; tag })))
-    | Pmake_unboxed_product _ -> pseudo_event (variadic (Makeblock { tag = 0 }))
+    | Pmake_unboxed_product _ ->
+      pseudo_event (variadic (Makeblock { tag = 0; mut = Mutable }))
     | Pgetglobal cu -> nullary (Getglobal cu)
     | Pgetpredef id -> nullary (Getpredef id)
     | Pfield (n, _, _) | Punboxed_product_field (n, _) -> unary (Getfield n)
@@ -548,8 +570,8 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         let element_size = Prim (Lsrint, [word_size; tagged_immediate 3]) in
         Sequence (comp_expr arg, element_size)
       | [] | _ :: _ :: _ -> wrong_arity ~expected:1)
-    | Pget_idx _ -> binary (Ccall "caml_get_idx_bytecode")
-    | Pset_idx _ -> ternary (Ccall "caml_set_idx_bytecode")
+    | Pget_idx _ -> binary (Ccall ("caml_get_idx_bytecode", None))
+    | Pset_idx _ -> ternary (Ccall ("caml_set_idx_bytecode", None))
     | Pmake_idx_field pos ->
       Const (Const_block (0, [Const_base (Const_int pos)]))
     | Pmake_idx_mixed_field (_, pos, path) ->
@@ -572,16 +594,16 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
             (* CR mshinwell: this is probably ok for now, but it seems like
                these conversions could silently overflow *)
           | Punboxed_or_untagged_integer_index Unboxed_int64 ->
-            unary (Ccall "caml_int64_to_int")
+            unary (Ccall ("caml_int64_to_int", None))
           | Punboxed_or_untagged_integer_index Unboxed_int32 ->
-            unary (Ccall "caml_int32_to_int")
+            unary (Ccall ("caml_int32_to_int", None))
           | Punboxed_or_untagged_integer_index Unboxed_nativeint ->
-            unary (Ccall "caml_nativeint_to_int")
+            unary (Ccall ("caml_nativeint_to_int", None))
         in
         let path =
           List.map (fun pos -> Const (Const_base (Const_int pos))) path
         in
-        Blambda.Prim (Makeblock { tag = 0 }, index :: path)
+        Blambda.Prim (Makeblock { tag = 0; mut = Mutable }, index :: path)
       | [] | _ :: _ :: _ -> wrong_arity ~expected:1)
     | Pidx_deepen (_, path) -> (
       (* In bytecode, an index is a block storing a series of positions; deepening
@@ -594,7 +616,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         in
         let path_suffix = Const (Const_block (0, path_suffix_consts)) in
         Blambda.Prim
-          (Ccall "caml_deepen_idx_bytecode", [path_prefix; path_suffix])
+          (Ccall ("caml_deepen_idx_bytecode", None), [path_prefix; path_suffix])
       | [] | _ :: _ :: _ -> wrong_arity ~expected:1)
     | Pfield_computed _sem -> binary Getvectitem
     | Psetfield (n, _ptr, _init) -> binary (Setfield n)
@@ -633,15 +655,21 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
           block parent_path
       in
       Prim (Setfield last_idx, [target_block; value_expr])
-    | Pduprecord _ -> unary (Ccall "caml_obj_dup")
-    | Pccall p -> n_ary (Ccall p.prim_name) ~arity:p.prim_arity
+    | Pduprecord _ -> unary (Ccall ("caml_obj_dup", None))
+    | Pccall p ->
+      let hint =
+        if Primitive.native_name p <> Primitive.byte_name p
+        then Some (Instruct.Hint_primitive p)
+        else None
+      in
+      n_ary (Ccall (p.prim_name, hint)) ~arity:p.prim_arity
     | Pperform -> context_switch Perform ~arity:1
     | Poffsetref n -> unary (Offsetref n)
-    | Pstringlength -> unary (Ccall "caml_ml_string_length")
-    | Pbyteslength -> unary (Ccall "caml_ml_bytes_length")
-    | Pstringrefs -> binary (Ccall "caml_string_get")
-    | Pbytesrefs -> binary (Ccall "caml_bytes_get")
-    | Pbytessets -> ternary (Ccall "caml_bytes_set")
+    | Pstringlength -> unary (Ccall ("caml_ml_string_length", None))
+    | Pbyteslength -> unary (Ccall ("caml_ml_bytes_length", None))
+    | Pstringrefs -> binary (Ccall ("caml_string_get", None))
+    | Pbytesrefs -> binary (Ccall ("caml_bytes_get", None))
+    | Pbytessets -> ternary (Ccall ("caml_bytes_set", None))
     | Pstringrefu -> binary Getstringchar
     | Pbytesrefu -> binary Getbyteschar
     | Pbytessetu -> ternary Setbyteschar
@@ -649,37 +677,49 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       binary (indexing_primitive index_kind "caml_string_geti8")
     | Pstring_load_i16 { index_kind; _ } ->
       binary (indexing_primitive index_kind "caml_string_geti16")
-    | Pstring_load_16 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_string_get16")
-    | Pstring_load_32 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_string_get32")
-    | Pstring_load_f32 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_string_getf32")
-    | Pstring_load_64 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_string_get64")
+    | Pstring_load_16 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_string_get16")
+    | Pstring_load_32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_string_get32")
+    | Pstring_load_f32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_string_getf32")
+    | Pstring_load_64 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_string_get64")
     | Pbytes_set_8 { index_kind; _ } ->
       ternary (indexing_primitive index_kind "caml_bytes_set8")
-    | Pbytes_set_16 { index_kind; _ } ->
-      ternary (indexing_primitive index_kind "caml_bytes_set16")
-    | Pbytes_set_32 { index_kind; _ } ->
-      ternary (indexing_primitive index_kind "caml_bytes_set32")
-    | Pbytes_set_f32 { index_kind; _ } ->
-      ternary (indexing_primitive index_kind "caml_bytes_setf32")
-    | Pbytes_set_64 { index_kind; _ } ->
-      ternary (indexing_primitive index_kind "caml_bytes_set64")
+    | Pbytes_set_16 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_bytes_set16")
+    | Pbytes_set_32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_bytes_set32")
+    | Pbytes_set_f32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_bytes_setf32")
+    | Pbytes_set_64 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_bytes_set64")
     | Pbytes_load_i8 { index_kind; _ } ->
       binary (indexing_primitive index_kind "caml_bytes_geti8")
     | Pbytes_load_i16 { index_kind; _ } ->
       binary (indexing_primitive index_kind "caml_bytes_geti16")
-    | Pbytes_load_16 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_bytes_get16")
-    | Pbytes_load_32 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_bytes_get32")
-    | Pbytes_load_f32 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_bytes_getf32")
-    | Pbytes_load_64 { index_kind; _ } ->
-      binary (indexing_primitive index_kind "caml_bytes_get64")
-    | Parraylength _ -> unary Vectlength
+    | Pbytes_load_16 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_bytes_get16")
+    | Pbytes_load_32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_bytes_get32")
+    | Pbytes_load_f32 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_bytes_getf32")
+    | Pbytes_load_64 { unsafe; index_kind; _ } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_bytes_get64")
+    | Parraylength kind -> unary (Vectlength kind)
     (* In bytecode, nothing is ever actually stack-allocated, so we ignore the
        array modes (allocation for [Parrayref{s,u}], modification for
        [Parrayset{s,u}]). *)
@@ -697,7 +737,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         ( (Punboxedfloatarray_ref Unboxed_float64 | Pfloatarray_ref _),
           Ptagged_int_index,
           _ ) ->
-      binary (Ccall "caml_floatarray_get")
+      binary (Ccall ("caml_floatarray_get", None))
     | Parrayrefs
         ( ( Punboxedfloatarray_ref Unboxed_float32
           | Punboxedoruntaggedintarray_ref _ | Paddrarray_ref
@@ -705,7 +745,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
           | Pgcscannableproductarray_ref _ | Pgcignorableproductarray_ref _ ),
           Ptagged_int_index,
           _ ) ->
-      binary (Ccall "caml_array_get_addr")
+      binary (Ccall ("caml_array_get_addr", None))
     | Parraysets (Pgenarray_set _, index_kind)
     | Parraysets
         ( ( Paddrarray_set _ | Pgcignorableaddrarray_set | Pintarray_set
@@ -718,14 +758,14 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
     | Parraysets
         ( (Punboxedfloatarray_set Unboxed_float64 | Pfloatarray_set),
           Ptagged_int_index ) ->
-      ternary (Ccall "caml_floatarray_set")
+      ternary (Ccall ("caml_floatarray_set", None))
     | Parraysets
         ( ( Punboxedfloatarray_set Unboxed_float32
           | Punboxedoruntaggedintarray_set _ | Paddrarray_set _
           | Pgcignorableaddrarray_set | Pintarray_set
           | Pgcscannableproductarray_set _ | Pgcignorableproductarray_set _ ),
           Ptagged_int_index ) ->
-      ternary (Ccall "caml_array_set_addr")
+      ternary (Ccall ("caml_array_set_addr", None))
     | Parrayrefu (Pgenarray_ref _, index_kind, _)
     | Parrayrefu
         ( ( Paddrarray_ref | Pgcignorableaddrarray_ref | Pintarray_ref
@@ -740,7 +780,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
         ( (Punboxedfloatarray_ref Unboxed_float64 | Pfloatarray_ref _),
           Ptagged_int_index,
           _ ) ->
-      binary (Ccall "caml_floatarray_unsafe_get")
+      binary (Ccall ("caml_floatarray_unsafe_get", None))
     | Parrayrefu
         ( ( Punboxedfloatarray_ref Unboxed_float32
           | Punboxedoruntaggedintarray_ref _ | Paddrarray_ref
@@ -761,7 +801,7 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
     | Parraysetu
         ( (Punboxedfloatarray_set Unboxed_float64 | Pfloatarray_set),
           Ptagged_int_index ) ->
-      ternary (Ccall "caml_floatarray_unsafe_set")
+      ternary (Ccall ("caml_floatarray_unsafe_set", None))
     | Parraysetu
         ( ( Punboxedfloatarray_set Unboxed_float32
           | Punboxedoruntaggedintarray_set _ | Paddrarray_set _
@@ -777,63 +817,105 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
     | Pctconst c -> unary (caml_sys_const c)
     | Pisint _ -> unary Isint
     | Pisout -> binary (Intcomp Ultint)
-    | Pbigarrayref (_, n, Pbigarray_float32_t, _) ->
-      n_ary (Ccall ("caml_ba_float32_get_" ^ Int.to_string n)) ~arity:(n + 1)
-    | Pbigarrayset (_, n, Pbigarray_float32_t, _) ->
-      n_ary (Ccall ("caml_ba_float32_set_" ^ Int.to_string n)) ~arity:(n + 2)
-    | Pbigarrayref (_, n, _, _) ->
-      n_ary (Ccall ("caml_ba_get_" ^ Int.to_string n)) ~arity:(n + 1)
-    | Pbigarrayset (_, n, _, _) ->
-      n_ary (Ccall ("caml_ba_set_" ^ Int.to_string n)) ~arity:(n + 2)
-    | Pbigarraydim n -> unary (Ccall ("caml_ba_dim_" ^ Int.to_string n))
+    | Pbigarrayref (unsafe, n, Pbigarray_float32_t, layout) ->
+      let hint =
+        Some (Instruct.Hint_bigarray
+                { unsafe; elt_kind = Pbigarray_float32; layout })
+      in
+      n_ary
+        (Ccall ("caml_ba_float32_get_" ^ Int.to_string n, hint))
+        ~arity:(n + 1)
+    | Pbigarrayset (unsafe, n, Pbigarray_float32_t, layout) ->
+      let hint =
+        Some (Instruct.Hint_bigarray
+                { unsafe; elt_kind = Pbigarray_float32; layout })
+      in
+      n_ary
+        (Ccall ("caml_ba_float32_set_" ^ Int.to_string n, hint))
+        ~arity:(n + 2)
+    | Pbigarrayref (unsafe, n, elt_kind, layout) ->
+      let hint =
+        Some (Instruct.Hint_bigarray { unsafe; elt_kind; layout })
+      in
+      n_ary
+        (Ccall ("caml_ba_get_" ^ Int.to_string n, hint))
+        ~arity:(n + 1)
+    | Pbigarrayset (unsafe, n, elt_kind, layout) ->
+      let hint =
+        Some (Instruct.Hint_bigarray { unsafe; elt_kind; layout })
+      in
+      n_ary
+        (Ccall ("caml_ba_set_" ^ Int.to_string n, hint))
+        ~arity:(n + 2)
+    | Pbigarraydim n ->
+      unary (Ccall ("caml_ba_dim_" ^ Int.to_string n, None))
     | Pbigstring_load_i8 { unsafe = _; index_kind } ->
       binary (indexing_primitive index_kind "caml_ba_uint8_geti8")
     | Pbigstring_load_i16 { unsafe = _; index_kind } ->
       binary (indexing_primitive index_kind "caml_ba_uint8_geti16")
-    | Pbigstring_load_16 { unsafe = _; index_kind } ->
-      binary (indexing_primitive index_kind "caml_ba_uint8_get16")
-    | Pbigstring_load_32 { unsafe = _; mode = _; index_kind } ->
-      binary (indexing_primitive index_kind "caml_ba_uint8_get32")
-    | Pbigstring_load_f32 { unsafe = _; mode = _; index_kind } ->
-      binary (indexing_primitive index_kind "caml_ba_uint8_getf32")
-    | Pbigstring_load_64 { unsafe = _; mode = _; index_kind } ->
-      binary (indexing_primitive index_kind "caml_ba_uint8_get64")
+    | Pbigstring_load_16 { unsafe; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_ba_uint8_get16")
+    | Pbigstring_load_32 { unsafe; mode = _; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_ba_uint8_get32")
+    | Pbigstring_load_f32 { unsafe; mode = _; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_ba_uint8_getf32")
+    | Pbigstring_load_64 { unsafe; mode = _; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      binary (indexing_primitive ~hint index_kind "caml_ba_uint8_get64")
     | Pbigstring_set_8 { unsafe = _; index_kind } ->
       ternary (indexing_primitive index_kind "caml_ba_uint8_set8")
-    | Pbigstring_set_16 { unsafe = _; index_kind } ->
-      ternary (indexing_primitive index_kind "caml_ba_uint8_set16")
-    | Pbigstring_set_32 { unsafe = _; index_kind } ->
-      ternary (indexing_primitive index_kind "caml_ba_uint8_set32")
-    | Pbigstring_set_f32 { unsafe = _; index_kind } ->
-      ternary (indexing_primitive index_kind "caml_ba_uint8_setf32")
-    | Pbigstring_set_64 { unsafe = _; index_kind } ->
-      ternary (indexing_primitive index_kind "caml_ba_uint8_set64")
-    | Pint_as_pointer _ -> unary (Ccall "caml_int_as_pointer")
-    | Pbytes_to_string -> unary (Ccall "caml_string_of_bytes")
-    | Pbytes_of_string -> unary (Ccall "caml_bytes_of_string")
-    | Parray_to_iarray -> unary (Ccall "caml_iarray_of_array")
-    | Parray_of_iarray -> unary (Ccall "caml_array_of_iarray")
-    | Pget_header _ -> unary (Ccall "caml_get_header")
-    | Pobj_dup -> unary (Ccall "caml_obj_dup")
-    | Patomic_load_field _ -> binary (Ccall "caml_atomic_load_field")
-    | Patomic_set_field _ -> ternary (Ccall "caml_atomic_set_field")
-    | Patomic_exchange_field _ -> ternary (Ccall "caml_atomic_exchange_field")
+    | Pbigstring_set_16 { unsafe; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_ba_uint8_set16")
+    | Pbigstring_set_32 { unsafe; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_ba_uint8_set32")
+    | Pbigstring_set_f32 { unsafe; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_ba_uint8_setf32")
+    | Pbigstring_set_64 { unsafe; index_kind } ->
+      let hint = if unsafe then Some Instruct.Hint_unsafe else None in
+      ternary (indexing_primitive ~hint index_kind "caml_ba_uint8_set64")
+    | Pint_as_pointer _ -> unary (Ccall ("caml_int_as_pointer", None))
+    | Pbytes_to_string -> unary (Ccall ("caml_string_of_bytes", None))
+    | Pbytes_of_string -> unary (Ccall ("caml_bytes_of_string", None))
+    | Parray_to_iarray -> unary (Ccall ("caml_iarray_of_array", None))
+    | Parray_of_iarray -> unary (Ccall ("caml_array_of_iarray", None))
+    | Pget_header _ -> unary (Ccall ("caml_get_header", None))
+    | Pobj_dup -> unary (Ccall ("caml_obj_dup", None))
+    | Patomic_load_field _ ->
+      binary (Ccall ("caml_atomic_load_field", None))
+    | Patomic_set_field _ ->
+      ternary (Ccall ("caml_atomic_set_field", None))
+    | Patomic_exchange_field _ ->
+      ternary (Ccall ("caml_atomic_exchange_field", None))
     | Patomic_compare_exchange_field _ ->
-      n_ary ~arity:4 (Ccall "caml_atomic_compare_exchange_field")
+      n_ary ~arity:4
+        (Ccall ("caml_atomic_compare_exchange_field", None))
     | Patomic_compare_set_field _ ->
-      n_ary ~arity:4 (Ccall "caml_atomic_cas_field")
-    | Patomic_fetch_add_field -> ternary (Ccall "caml_atomic_fetch_add_field")
-    | Patomic_add_field -> ternary (Ccall "caml_atomic_add_field")
-    | Patomic_sub_field -> ternary (Ccall "caml_atomic_sub_field")
-    | Patomic_land_field -> ternary (Ccall "caml_atomic_land_field")
-    | Patomic_lor_field -> ternary (Ccall "caml_atomic_lor_field")
-    | Patomic_lxor_field -> ternary (Ccall "caml_atomic_lxor_field")
-    | Pdls_get -> unary (Ccall "caml_domain_dls_get")
-    | Ptls_get -> unary (Ccall "caml_domain_tls_get")
-    | Pdomain_index -> unary (Ccall "caml_ml_domain_index")
-    | Ppoll -> unary (Ccall "caml_process_pending_actions_with_root")
-    | Pcpu_relax -> unary (Ccall "caml_ml_domain_cpu_relax")
-    | Pisnull -> unary (Ccall "caml_is_null")
+      n_ary ~arity:4 (Ccall ("caml_atomic_cas_field", None))
+    | Patomic_fetch_add_field ->
+      ternary (Ccall ("caml_atomic_fetch_add_field", None))
+    | Patomic_add_field ->
+      ternary (Ccall ("caml_atomic_add_field", None))
+    | Patomic_sub_field ->
+      ternary (Ccall ("caml_atomic_sub_field", None))
+    | Patomic_land_field ->
+      ternary (Ccall ("caml_atomic_land_field", None))
+    | Patomic_lor_field ->
+      ternary (Ccall ("caml_atomic_lor_field", None))
+    | Patomic_lxor_field ->
+      ternary (Ccall ("caml_atomic_lxor_field", None))
+    | Pdls_get -> unary (Ccall ("caml_domain_dls_get", None))
+    | Ptls_get -> unary (Ccall ("caml_domain_tls_get", None))
+    | Pdomain_index -> unary (Ccall ("caml_ml_domain_index", None))
+    | Ppoll ->
+      unary (Ccall ("caml_process_pending_actions_with_root", None))
+    | Pcpu_relax -> unary (Ccall ("caml_ml_domain_cpu_relax", None))
+    | Pisnull -> unary (Ccall ("caml_is_null", None))
     | Pstring_load_vec _ | Pbytes_load_vec _ | Pbytes_set_vec _
     | Pbigstring_load_vec _ | Pbigstring_set_vec _ | Pfloatarray_load_vec _
     | Pfloat_array_load_vec _ | Pint_array_load_vec _
@@ -851,14 +933,14 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       simd_is_not_supported ()
     | Preinterpret_tagged_int63_as_unboxed_int64 ->
       if Target_system.is_64_bit ()
-      then unary (Ccall "caml_reinterpret_tagged_int63_as_unboxed_int64")
+      then unary (Ccall ("caml_reinterpret_tagged_int63_as_unboxed_int64", None))
       else
         Misc.fatal_error
           "Preinterpret_tagged_int63_as_unboxed_int64 can only be used on \
            64-bit targets"
     | Preinterpret_unboxed_int64_as_tagged_int63 ->
       if Target_system.is_64_bit ()
-      then unary (Ccall "caml_reinterpret_unboxed_int64_as_tagged_int63")
+      then unary (Ccall ("caml_reinterpret_unboxed_int64_as_tagged_int63", None))
       else
         Misc.fatal_error
           "Preinterpret_unboxed_int64_as_tagged_int63 can only be used on \
@@ -879,8 +961,8 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       | Punboxedoruntaggedintarray _ | Pfloatarray | Punboxedfloatarray _
       | Pgcscannableproductarray _ | Pgcignorableproductarray _ -> (
         match locality with
-        | Alloc_heap -> binary (Ccall "caml_array_make")
-        | Alloc_local -> binary (Ccall "caml_array_make_local")))
+        | Alloc_heap -> binary (Ccall ("caml_array_make", None))
+        | Alloc_local -> binary (Ccall ("caml_array_make_local", None))))
     | Parrayblit { src_mutability = _; dst_array_set_kind } -> (
       match dst_array_set_kind with
       | Punboxedvectorarray_set _ -> simd_is_not_supported ()
@@ -888,14 +970,16 @@ let rec comp_expr (exp : Lambda.lambda) : Blambda.blambda =
       | Pgcignorableaddrarray_set | Punboxedoruntaggedintarray_set _
       | Pfloatarray_set | Punboxedfloatarray_set _
       | Pgcscannableproductarray_set _ | Pgcignorableproductarray_set _ ->
-        n_ary (Ccall "caml_array_blit") ~arity:5)
+        n_ary (Ccall ("caml_array_blit", None)) ~arity:5)
     | Pprobe_is_enabled _ | Ppeek _ | Ppoke _ | Pget_ptr _ | Pset_ptr _ ->
       Misc.fatal_errorf "Blambda_of_lambda: %a is not supported in bytecode"
         Printlambda.primitive primitive
     | Pmakelazyblock Lazy_tag ->
-      pseudo_event (variadic (Makeblock { tag = Config.lazy_tag }))
+      pseudo_event
+        (variadic (Makeblock { tag = Config.lazy_tag; mut = Mutable }))
     | Pmakelazyblock Forward_tag ->
-      pseudo_event (variadic (Makeblock { tag = Obj.forward_tag }))
+      pseudo_event
+        (variadic (Makeblock { tag = Obj.forward_tag; mut = Mutable }))
     | Pscalar (Unary unary) -> (
       match args with
       | [x] -> comp_unary_scalar_intrinsic unary (comp_expr x)
@@ -1000,19 +1084,28 @@ and comp_binary_scalar_intrinsic : type a.
       in
       Prim (Intcomp cmp, [x; y])
     | Boxable
-        ( Int32 Any_locality_mode
+        (( Int32 Any_locality_mode
         | Nativeint Any_locality_mode
-        | Int64 Any_locality_mode ) -> (
+        | Int64 Any_locality_mode ) as sz) -> (
+      let hint = Some (Instruct.Hint_int sz) in
+      let hprim prim = Prim (prim, [x; y]) in
+      let hccall fmt =
+        Printf.ksprintf
+          (fun name -> hprim (Ccall (name, hint)))
+          fmt
+      in
       let make_unsigned_comparison name =
-        make_unsigned_comparison size (fun x y -> Prim (Ccall name, [x; y])) x y
+        make_unsigned_comparison size
+          (fun x y -> Prim (Ccall (name, hint), [x; y]))
+          x y
       in
       match cmp with
-      | Ceq -> ccall "caml_equal"
-      | Cne -> ccall "caml_notequal"
-      | Clt -> ccall "caml_lessthan"
-      | Cle -> ccall "caml_lessequal"
-      | Cgt -> ccall "caml_greaterthan"
-      | Cge -> ccall "caml_greaterequal"
+      | Ceq -> hccall "caml_equal"
+      | Cne -> hccall "caml_notequal"
+      | Clt -> hccall "caml_lessthan"
+      | Cle -> hccall "caml_lessequal"
+      | Cgt -> hccall "caml_greaterthan"
+      | Cge -> hccall "caml_greaterequal"
       | Cult -> make_unsigned_comparison "caml_lessthan"
       | Cugt -> make_unsigned_comparison "caml_greaterthan"
       | Cule -> make_unsigned_comparison "caml_lessequal"
@@ -1036,10 +1129,14 @@ and comp_binary_scalar_intrinsic : type a.
   | Three_way_compare_int (signedness, size) -> (
     let make_signed_compare x y =
       match Scalar.Integral.width size with
-      | Taggable (Int | Int8 | Int16) -> Prim (Ccall "caml_int_compare", [x; y])
-      | Boxable (Int32 _) -> Prim (Ccall "caml_int32_compare", [x; y])
-      | Boxable (Int64 _) -> Prim (Ccall "caml_int64_compare", [x; y])
-      | Boxable (Nativeint _) -> Prim (Ccall "caml_nativeint_compare", [x; y])
+      | Taggable (Int | Int8 | Int16) ->
+        Prim (Ccall ("caml_int_compare", None), [x; y])
+      | Boxable (Int32 _) ->
+        Prim (Ccall ("caml_int32_compare", None), [x; y])
+      | Boxable (Int64 _) ->
+        Prim (Ccall ("caml_int64_compare", None), [x; y])
+      | Boxable (Nativeint _) ->
+        Prim (Ccall ("caml_nativeint_compare", None), [x; y])
     in
     match (signedness : Scalar.Signedness.t) with
     | Signed -> make_signed_compare x y
